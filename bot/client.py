@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -11,11 +13,12 @@ from bot.embeds import (
     build_catalog_stats_embed,
     build_diff_embed,
     build_inspect_pages,
-    build_poll_embed,
-    build_poll_ok_embed,
+    build_minute_report_embed,
 )
-from bot.views import InspectPickView, send_inspect
-from catalog.service import CatalogDiff, CatalogService
+from bot.poll_window import PollWindow
+from bot.views import InspectPickView, InspectView, send_inspect
+from catalog.item_kind import is_clothing
+from catalog.service import CatalogService
 from config.settings import Settings
 from economy.service import EconomyService
 from madxka.http import MadxkaHttp
@@ -43,6 +46,8 @@ class MadokaBot(commands.Bot):
         self.api = MadxkaHttp(settings.cookie)
         self.catalog = CatalogService(self.api, self.cache)
         self.economy = EconomyService(self.api)
+        self._watch_channel_cache: discord.abc.Messageable | None = None
+        self._poll_window = PollWindow()
 
     def _register_commands(self) -> None:
         self.tree.add_command(inspect_cmd)
@@ -95,7 +100,7 @@ class MadokaBot(commands.Bot):
 
         await self._sync_commands()
 
-        self.watch_loop.change_interval(minutes=self.settings.poll_interval_minutes)
+        self.watch_loop.change_interval(seconds=self.settings.poll_interval_seconds)
         self.watch_loop.start()
 
     async def on_ready(self) -> None:
@@ -116,6 +121,9 @@ class MadokaBot(commands.Bot):
         await super().close()
 
     async def _watch_channel(self) -> discord.abc.Messageable | None:
+        if self._watch_channel_cache is not None:
+            return self._watch_channel_cache
+
         channel_id = self.settings.watch_channel_id
         if not channel_id:
             return None
@@ -123,87 +131,132 @@ class MadokaBot(commands.Bot):
         if channel is None:
             try:
                 channel = await self.fetch_channel(channel_id)
-            except Exception:
+            except Exception as e:
+                print(f"[madoka] watch channel fetch failed: {e}")
                 return None
         if not isinstance(channel, discord.abc.Messageable):
+            print(f"[madoka] watch channel {channel_id} is not messageable")
             return None
+        self._watch_channel_cache = channel
         return channel
 
-    async def _announce_ok(self) -> None:
+    async def _watch_send(
+        self,
+        *,
+        content: str | None = None,
+        embed: discord.Embed | None = None,
+        view: discord.ui.View | None = None,
+    ) -> None:
         channel = await self._watch_channel()
         if channel is None:
+            print("[madoka] watch send skipped: no channel")
             return
-        await channel.send(embed=build_poll_ok_embed(stats=self.catalog.stats()))
+        try:
+            await channel.send(content=content, embed=embed, view=view)
+        except Exception as e:
+            print(f"[madoka] watch send failed: {e}")
+            self._watch_channel_cache = None
 
-    async def _announce_diff(self, diff: CatalogDiff) -> None:
-        total = len(diff.added) + len(diff.changed) + len(diff.removed)
-        if total <= 0:
+    async def _resolve_items(self, stubs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not stubs:
+            return []
+        rows = await self.catalog.hydrate_stubs(stubs)
+        by_id = {int(r.get("id") or 0): r for r in rows}
+        out: list[dict] = []
+        for stub in stubs:
+            item_id = int(stub.get("id") or 0)
+            row = by_id.get(item_id)
+            if row:
+                out.append(row)
+            elif item_id:
+                out.append({"id": item_id, "name": str(item_id)})
+        return out
+
+    async def _announce_drop(self, stub: dict[str, Any]) -> None:
+        rows = await self._resolve_items([stub])
+        if not rows:
             return
+        item = rows[0]
+        item_id = int(item.get("id") or 0)
+        owner_id = self.settings.wallet_owner_id
 
-        print(
-            f"[madoka] poll +{len(diff.added)} "
-            f"~{len(diff.changed)} -{len(diff.removed)}"
+        try:
+            balance = await self.economy.balance()
+        except Exception:
+            balance = None
+
+        thumb = await self.api.asset_thumbnail(item_id)
+        cache_stub = self.cache.find_stub(item_id)
+        pages = build_inspect_pages(item, stub=cache_stub, thumbnail=thumb, balance=balance)
+        view = InspectView(
+            self,
+            item=item,
+            pages=pages,
+            owner_id=owner_id,
+            allow_buy=True,
         )
+        ping = None if is_clothing(item) else f"<@{owner_id}>"
+        await self._watch_send(content=ping, embed=pages[0], view=view)
+        print(f"[madoka] drop `{item_id}` {item.get('name')}")
 
-        channel = await self._watch_channel()
-        if channel is None:
+    async def _send_minute_report(self) -> None:
+        window = self._poll_window
+        polls = window.polls
+        if polls <= 0:
             return
 
-        added_ids = {int(s.get("id") or 0) for s in diff.added}
-        targets = diff.added + [new for _old, new in diff.changed]
-        details = await self.catalog.hydrate_stubs(targets)
-        added_rows = [row for row in details if int(row.get("id") or 0) in added_ids]
+        added_rows = await self._resolve_items(list(window.added.values()))
+        changed_rows = await self._resolve_items(list(window.changed.values()))
+        removed_rows = await self._resolve_items(list(window.removed.values()))
 
-        poll_embed = build_poll_embed(
+        embed = build_minute_report_embed(
+            polls=polls,
             added=added_rows,
-            changed_count=len(diff.changed),
-            removed_count=len(diff.removed),
+            changed=changed_rows,
+            removed=removed_rows,
             stats=self.catalog.stats(),
         )
-        await channel.send(embed=poll_embed)
 
-        if not added_rows:
-            return
+        ping_items = added_rows + changed_rows + removed_rows
+        owner_id = self.settings.wallet_owner_id
+        ping = None
+        if any(not is_clothing(item) for item in ping_items):
+            ping = f"<@{owner_id}>"
 
-        item_ids = [int(item.get("id") or 0) for item in added_rows[:5]]
-        thumbs = await self.api.asset_thumbnails(item_ids)
-        for item in added_rows[:5]:
-            item_id = int(item.get("id") or 0)
-            thumb = thumbs.get(item_id)
-            stub = self.cache.find_stub(item_id)
-            pages = build_inspect_pages(item, stub=stub, thumbnail=thumb)
-            embed = pages[0]
-            embed.title = f"New item · {embed.title}"
-            await channel.send(embed=embed)
+        await self._watch_send(content=ping, embed=embed)
+        print(
+            f"[madoka] minute report · polled {polls} · "
+            f"+{len(added_rows)} ~{len(changed_rows)} -{len(removed_rows)}"
+        )
 
-        if len(added_rows) > 5:
-            await channel.send(embed=discord.Embed(
-                description=f"-# +{len(added_rows) - 5} more new items",
-                color=0xFEE75C,
-            ))
-
-    @tasks.loop(minutes=1)
+    @tasks.loop(seconds=1)
     async def watch_loop(self) -> None:
         try:
+            self._poll_window.polls += 1
             diff = await self.catalog.refresh(force=False)
+
+            if diff is not None:
+                total = len(diff.added) + len(diff.changed) + len(diff.removed)
+                if total > 0:
+                    self._poll_window.merge(diff)
+                    if self.settings.debug:
+                        print(
+                            f"[madoka] poll +{len(diff.added)} "
+                            f"~{len(diff.changed)} -{len(diff.removed)}"
+                        )
+                    for stub in diff.added:
+                        await self._announce_drop(stub)
+
+            report_every = max(1, self.settings.poll_report_seconds // self.settings.poll_interval_seconds)
+            if self._poll_window.polls >= report_every:
+                await self._send_minute_report()
+                self._poll_window.reset()
         except Exception as e:
-            print(f"[madoka] poll failed: {e}")
-            return
+            print(f"[madoka] poll cycle failed: {e}")
 
-        if diff is None:
-            if self.settings.debug:
-                print("[madoka] poll: no changes")
-            await self._announce_ok()
-            return
-
-        total = len(diff.added) + len(diff.changed) + len(diff.removed)
-        if total <= 0:
-            if self.settings.debug:
-                print("[madoka] poll: hash changed but no diff rows")
-            await self._announce_ok()
-            return
-
-        await self._announce_diff(diff)
+    @watch_loop.error
+    async def watch_loop_error(self, error: BaseException) -> None:
+        print(f"[madoka] watch loop crashed: {error}")
 
     @watch_loop.before_loop
     async def before_watch_loop(self) -> None:
@@ -284,23 +337,31 @@ async def buy_free_cmd(interaction: discord.Interaction) -> None:
         return
 
     await interaction.response.defer(thinking=True, ephemeral=True)
+    print("[buy free] command started")
     try:
+        print("[buy free] refreshing catalog...")
         await bot.catalog.refresh(force=True)
+        print("[buy free] scanning free on-sale items...")
         free_items = await bot.catalog.free_items()
+        print(f"[buy free] found {len(free_items)} free on-sale item(s)")
     except Exception as e:
+        print(f"[buy free] catalog scan failed: {e}")
         await interaction.followup.send(f"Catalog scan failed: `{e}`", ephemeral=True)
         return
 
     if not free_items:
+        print("[buy free] nothing to buy")
         await interaction.followup.send("No free on-sale items found in the catalog.", ephemeral=True)
         return
 
     try:
         outcome = await bot.economy.purchase_all_free(free_items)
     except Exception as e:
+        print(f"[buy free] failed: {e}")
         await interaction.followup.send(f"Buy free failed: `{e}`", ephemeral=True)
         return
 
+    print("[buy free] command finished")
     await interaction.followup.send(embed=build_buy_free_embed(outcome), ephemeral=True)
 
 

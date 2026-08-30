@@ -12,16 +12,28 @@ if TYPE_CHECKING:
     from bot.client import MadokaBot
 
 
+def _item_url(item: dict[str, Any]) -> str:
+    item_id = int(item.get("id") or 0)
+    name = str(item.get("name") or item_id)
+    return catalog_item(item_id, name)
+
+
 def _price_text(item: dict[str, Any]) -> str:
     if item.get("isForSale") is False:
         return "Offsale"
     price = item.get("price")
-    if price is None:
-        lowest = item.get("lowestPrice")
-        if lowest is not None:
-            return f"{int(lowest):,} R$ (resale)"
-        return "Free"
-    return f"{int(price):,} R$"
+    tix = item.get("priceTickets")
+    if price is not None:
+        robux = f"Free" if int(price) == 0 else f"{int(price):,} R$"
+        if tix is not None:
+            return f"{robux} / {int(tix):,} tix"
+        return robux
+    lowest = item.get("lowestPrice")
+    if lowest is not None:
+        return f"{int(lowest):,} R$ (resale)"
+    if tix is not None:
+        return f"{int(tix):,} tix"
+    return "—"
 
 
 def _limited_text(item: dict[str, Any]) -> str:
@@ -119,6 +131,11 @@ def _inspect_body_md(item: dict[str, Any], item_id: int) -> str:
     parts.append(_md_line("ID", f"`{item_id}`"))
     parts.append(_md_line("Limited", _md_val(item.get("isLimited"))))
     parts.append(_md_line("Limited U", _md_val(item.get("isLimitedUnique"))))
+    price = item.get("price")
+    if price is None:
+        parts.append(_md_line("Price", "—"))
+    else:
+        parts.append(_md_line("Price", "Free" if int(price) == 0 else f"{int(price):,} R$"))
     parts.append(_md_line("Ticket price", _md_val(item.get("priceTickets"))))
     serials = item.get("serialCount")
     parts.append(_md_line("Serials", f"{int(serials):,}" if serials is not None else "—"))
@@ -146,6 +163,7 @@ def build_balance_embed(payload: dict[str, Any]) -> discord.Embed:
 
 def build_purchase_embed(item: dict[str, Any], outcome: dict[str, Any]) -> discord.Embed:
     result = outcome.get("result") or {}
+    request = outcome.get("request") or {}
     ok = bool(outcome.get("purchased"))
     embed = discord.Embed(
         title="Purchase " + ("success" if ok else "failed"),
@@ -154,10 +172,15 @@ def build_purchase_embed(item: dict[str, Any], outcome: dict[str, Any]) -> disco
     )
     item_id = int(item.get("id") or 0)
     name = str(item.get("name") or item_id)
-    embed.description = f"[{name}]({catalog_item(item_id)}) · `{item_id}`"
+    embed.description = f"[{name}]({_item_url(item)}) · `{item_id}`"
     embed.add_field(name="Reason", value=str(outcome.get("reason") or result.get("reason") or "?"), inline=False)
-    if result.get("price") is not None:
-        embed.add_field(name="Paid", value=f"{int(result['price']):,} R$", inline=True)
+    currency = int(request.get("expectedCurrency") or result.get("currency") or 1)
+    unit = "tix" if currency == 2 else "R$"
+    paid = result.get("price")
+    if paid is None:
+        paid = request.get("expectedPrice")
+    if paid is not None:
+        embed.add_field(name="Paid", value=f"{int(paid):,} {unit}", inline=True)
     if result.get("sellerName"):
         embed.add_field(name="Seller", value=str(result["sellerName"]), inline=True)
     return embed
@@ -203,10 +226,61 @@ def build_diff_embed(
         for item in added[:8]:
             item_id = int(item.get("id") or 0)
             name = str(item.get("name") or item_id)
-            lines.append(f"[{name}]({catalog_item(item_id)}) · `{item_id}`")
+            lines.append(f"[{name}]({_item_url(item)}) · `{item_id}`")
         if len(added) > 8:
             lines.append(f"-# +{len(added) - 8} more")
         embed.add_field(name="New items", value="\n".join(lines), inline=False)
+
+    return embed
+
+
+def build_minute_report_embed(
+    *,
+    polls: int,
+    added: list[dict[str, Any]],
+    changed: list[dict[str, Any]],
+    removed: list[dict[str, Any]],
+    stats: dict[str, Any] | None = None,
+) -> discord.Embed:
+    embed = discord.Embed(
+        title="Poll Minute Report",
+        description=f"Polled **{polls:,}** time(s) this minute.",
+        color=0x5865F2 if added or changed or removed else 0x57F287,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="Added", value=str(len(added)), inline=True)
+    embed.add_field(name="Changed", value=str(len(changed)), inline=True)
+    embed.add_field(name="Removed", value=str(len(removed)), inline=True)
+
+    def _lines(items: list[dict[str, Any]], limit: int = 20) -> str:
+        if not items:
+            return "—"
+        rows: list[str] = []
+        for item in items[:limit]:
+            item_id = int(item.get("id") or 0)
+            name = str(item.get("name") or item_id)
+            price = _price_text(item)
+            rows.append(f"[{name}]({_item_url(item)}) · `{item_id}` · {price}")
+        if len(items) > limit:
+            rows.append(f"-# +{len(items) - limit} more")
+        return "\n".join(rows)[:1024]
+
+    if added:
+        embed.add_field(name="Added items", value=_lines(added), inline=False)
+    if changed:
+        embed.add_field(name="Changed items", value=_lines(changed), inline=False)
+    if removed:
+        embed.add_field(name="Removed items", value=_lines(removed, limit=20), inline=False)
+
+    if stats:
+        bits: list[str] = []
+        if stats.get("count") is not None:
+            bits.append(f"{int(stats['count']):,} items tracked")
+        digest = stats.get("hash")
+        if digest:
+            bits.append(f"hash `{str(digest)[:16]}`")
+        if bits:
+            embed.set_footer(text=" · ".join(bits))
 
     return embed
 
@@ -250,7 +324,7 @@ def build_buy_free_embed(outcome: dict[str, Any]) -> discord.Embed:
         for item in bought[:12]:
             item_id = int(item.get("id") or 0)
             name = str(item.get("name") or item_id)
-            lines.append(f"[{name}]({catalog_item(item_id)}) · `{item_id}`")
+            lines.append(f"[{name}]({_item_url(item)}) · `{item_id}`")
         if len(bought) > 12:
             lines.append(f"-# +{len(bought) - 12} more")
         embed.add_field(name="Purchased items", value="\n".join(lines)[:1024], inline=False)
@@ -293,7 +367,7 @@ def build_poll_embed(
             item_id = int(item.get("id") or 0)
             name = str(item.get("name") or item_id)
             price = _price_text(item)
-            lines.append(f"[{name}]({catalog_item(item_id)}) · `{item_id}` · {price}")
+            lines.append(f"[{name}]({_item_url(item)}) · `{item_id}` · {price}")
         if len(added) > 10:
             lines.append(f"-# +{len(added) - 10} more")
         embed.add_field(name="New items", value="\n".join(lines)[:1024], inline=False)
@@ -333,7 +407,7 @@ def build_inspect_pages(
 
     embed = discord.Embed(
         title=name,
-        url=catalog_item(item_id),
+        url=catalog_item(item_id, name),
         description=_inspect_body_md(merged, item_id),
         color=0xEB459E,
         timestamp=datetime.now(timezone.utc),
